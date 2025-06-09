@@ -76,67 +76,67 @@ func (p *Pod) Wait() (*corev1.Pod, error) {
 		return nil, err
 	}
 
-	stopC := make(chan struct{})
-	eventC := make(chan interface{}, 10)
-	mu := sync.Mutex{}
-	defer func() {
-		mu.Lock()
-		close(stopC)
-		close(eventC)
-		mu.Unlock()
-	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	eventC := make(chan interface{}, 1)
+	var wg sync.WaitGroup
 
-	p.watcher(stopC, eventC, &mu)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.watcher(ctx, eventC)
+	}()
 
 	var pod *corev1.Pod
 	var err error
 	for e := range eventC {
 		pod, err = checkPodStatus(e)
 		if pod != nil || err != nil {
+			cancel()
 			break
 		}
 	}
 
+	wg.Wait()
+
 	return pod, err
 }
 
-func (p *Pod) watcher(stopC <-chan struct{}, eventC chan<- interface{}, mu *sync.Mutex) {
+func (p *Pod) watcher(ctx context.Context, eventC chan<- interface{}) {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		p.Kc, time.Second*10,
 		informers.WithNamespace(p.Ns),
 		informers.WithTweakListOptions(podOpts(p.Name)))
 
+	stopCh := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		close(stopCh)
+	}()
+
 	_, err := factory.Core().V1().Pods().Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				mu.Lock()
-				defer mu.Unlock()
 				select {
-				case <-stopC:
+				case <-ctx.Done():
 					return
+				case eventC <- obj:
 				default:
-					// default is used to avoid pseudo-random selection of multiple matching cases
-					eventC <- obj
 				}
 			},
 			UpdateFunc: func(_, newObj interface{}) {
-				mu.Lock()
-				defer mu.Unlock()
 				select {
-				case <-stopC:
+				case <-ctx.Done():
 					return
+				case eventC <- newObj:
 				default:
-					eventC <- newObj
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
-				mu.Lock()
-				defer mu.Unlock()
 				select {
-				case <-stopC:
+				case <-ctx.Done():
 					return
+				case eventC <- obj:
 				default:
-					eventC <- obj
 				}
 			},
 		})
@@ -144,8 +144,10 @@ func (p *Pod) watcher(stopC <-chan struct{}, eventC chan<- interface{}, mu *sync
 		return
 	}
 
-	factory.Start(stopC)
-	factory.WaitForCacheSync(stopC)
+	factory.Start(stopCh)
+	factory.WaitForCacheSync(stopCh)
+
+	close(eventC)
 }
 
 func podOpts(name string) func(opts *metav1.ListOptions) {

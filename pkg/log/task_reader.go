@@ -127,7 +127,7 @@ func (r *Reader) readStepsLogs(logC chan<- Log, errC chan<- error, steps []*step
 		}
 
 		container := pod.Container(step.container)
-		containerLogC, containerLogErrC, err := container.LogReader(follow, timestamps).Read()
+		containerLogC, containerLogErrC, err := container.LogReader(follow, timestamps, r.activityTimeout).Read()
 		if err != nil {
 			errC <- fmt.Errorf("error in getting logs for step %s: %s", step.name, err)
 			continue

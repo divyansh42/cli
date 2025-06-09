@@ -16,8 +16,10 @@ package pods
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/tektoncd/cli/pkg/pods/stream"
 	corev1 "k8s.io/api/core/v1"
@@ -80,10 +82,11 @@ type LogReader struct {
 	pod           *Pod
 	follow        bool
 	timestamps    bool
+	timeout       time.Duration
 }
 
-func (c *Container) LogReader(follow, timestamps bool) *LogReader {
-	return &LogReader{c.name, c.pod, follow, timestamps}
+func (c *Container) LogReader(follow, timestamps bool, timeout time.Duration) *LogReader {
+	return &LogReader{c.name, c.pod, follow, timestamps, timeout}
 }
 
 func (lr *LogReader) Read() (<-chan Log, <-chan error, error) {
@@ -92,6 +95,15 @@ func (lr *LogReader) Read() (<-chan Log, <-chan error, error) {
 		Follow:     lr.follow,
 		Container:  lr.containerName,
 		Timestamps: lr.timestamps,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if lr.timeout != 0 {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, lr.timeout)
+		defer timeoutCancel()
 	}
 
 	stream, err := pod.Stream(opts)
@@ -109,19 +121,25 @@ func (lr *LogReader) Read() (<-chan Log, <-chan error, error) {
 
 		r := bufio.NewReader(stream)
 		for {
-			line, _, err := r.ReadLine()
-
-			if err != nil {
-				if err != io.EOF {
-					errC <- err
-				}
+			select {
+			case <-ctx.Done():
+				errC <- fmt.Errorf("log stream for pod %s(%s) timed out: %w", pod.Name, lr.containerName, ctx.Err())
 				return
-			}
+			default:
+				line, _, err := r.ReadLine()
 
-			logC <- Log{
-				PodName:       pod.Name,
-				ContainerName: lr.containerName,
-				Log:           string(line),
+				if err != nil {
+					if err != io.EOF {
+						errC <- err
+					}
+					return
+				}
+
+				logC <- Log{
+					PodName:       pod.Name,
+					ContainerName: lr.containerName,
+					Log:           string(line),
+				}
 			}
 		}
 	}()
